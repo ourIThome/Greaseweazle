@@ -42,7 +42,7 @@ static const struct gw_delay factory_delay_params = {
     .step_delay = 5000,
     .seek_settle = 15,
     .motor_delay = 750,
-    .auto_off = 10000
+    .watchdog = 10000
 };
 
 #if STM32F == 1
@@ -81,7 +81,7 @@ static struct dma_ring {
 static struct {
     time_t deadline;
     bool_t armed;
-} auto_off;
+} watchdog;
 
 /* Marshalling and unmarshalling of USB packets. */
 static struct {
@@ -136,25 +136,46 @@ static void step_once(void)
     delay_us(delay_params.step_delay);
 }
 
-static void _set_bus_type(uint8_t type)
+static uint8_t floppy_seek_initialise(struct unit *u)
 {
-    bus_type = type;
-    unit_nr = -1;
-    memset(unit, 0, sizeof(unit));
-    reset_bus();
-}
+    int nr;
 
-static bool_t set_bus_type(uint8_t type)
-{
-    if (type == bus_type)
-        return TRUE;
+    /* Synchronise to cylinder 0. */
+    step_dir_out();
+    for (nr = 0; nr < 256; nr++) {
+        if (get_trk0() == LOW)
+            goto found_cyl0;
+        step_once();
+    }
+    return ACK_NO_TRK0;
 
-    if (type > BUS_SHUGART)
-        return FALSE;
+found_cyl0:
 
-    _set_bus_type(type);
+    u->cyl = 0;
+    u->is_flippy = flippy_detect();
 
-    return TRUE;
+    if (u->is_flippy) {
+
+        /* Trk0 sensor can be asserted at negative cylinder offsets. Seek
+         * inwards until the sensor is deasserted. */
+        step_dir_in();
+        for (nr = 0; nr < 10; nr++) {
+            step_once();
+            if (get_trk0() == HIGH) {
+                /* We are now at real cylinder 1. */
+                u->cyl = 1;
+                break;
+            }
+        }
+
+        /* Bail if we didn't find cylinder 1. */
+        if (u->cyl != 1)
+            return ACK_NO_TRK0;
+
+    }
+
+    u->initialised = TRUE;
+    return ACK_OKAY;
 }
 
 static uint8_t floppy_seek(int cyl)
@@ -167,28 +188,20 @@ static uint8_t floppy_seek(int cyl)
     u = &unit[unit_nr];
 
     if (!u->initialised) {
-        step_dir_out();
-        for (nr = 0; nr < 256; nr++) {
-            if (get_trk0() == LOW)
-                goto found_trk0;
-            step_once();
-        }
-        return ACK_NO_TRK0;
-    found_trk0:
-        u->is_flippy = flippy_detect();
-        u->initialised = TRUE;
-        u->cyl = 0;
+        uint8_t rc = floppy_seek_initialise(u);
+        if (rc != ACK_OKAY)
+            return rc;
     }
 
     if ((cyl < (u->is_flippy ? -8 : 0)) || (cyl > 100))
         return ACK_BAD_CYLINDER;
 
-    flippy_trk0_sensor_disable();
-
     if (u->cyl <= cyl) {
         nr = cyl - u->cyl;
         step_dir_in();
     } else {
+        if (cyl < 0)
+            flippy_trk0_sensor_disable();
         nr = u->cyl - cyl;
         step_dir_out();
     }
@@ -225,7 +238,7 @@ static void floppy_flux_end(void)
         continue;
 }
 
-static void do_auto_off(void)
+static void quiesce_drives(void)
 {
     int i;
 
@@ -234,10 +247,8 @@ static void do_auto_off(void)
     for (i = 0; i < ARRAY_SIZE(unit); i++) {
 
         struct unit *u = &unit[i];
-        if (!u->initialised)
-            continue;
 
-        if (u->cyl < 0) {
+        if (u->initialised && (u->cyl < 0)) {
             drive_select(i);
             floppy_seek(0);
         }
@@ -249,13 +260,34 @@ static void do_auto_off(void)
 
     drive_deselect();
 
-    auto_off.armed = FALSE;
+    watchdog.armed = FALSE;
+}
+
+static void _set_bus_type(uint8_t type)
+{
+    quiesce_drives();
+    bus_type = type;
+    unit_nr = -1;
+    memset(unit, 0, sizeof(unit));
+}
+
+static bool_t set_bus_type(uint8_t type)
+{
+    if (type == bus_type)
+        return TRUE;
+
+    if (type > BUS_SHUGART)
+        return FALSE;
+
+    _set_bus_type(type);
+
+    return TRUE;
 }
 
 static void floppy_reset(void)
 {
     floppy_state = ST_inactive;
-    do_auto_off();
+    quiesce_drives();
     act_led(FALSE);
 }
 
@@ -295,20 +327,20 @@ struct gw_info gw_info = {
     .hw_model = STM32F
 };
 
-static void auto_off_nudge(void)
+static void watchdog_kick(void)
 {
-    auto_off.deadline = time_now() + time_ms(delay_params.auto_off);
+    watchdog.deadline = time_now() + time_ms(delay_params.watchdog);
 }
 
-static void auto_off_arm(void)
+static void watchdog_arm(void)
 {
-    auto_off.armed = TRUE;
-    auto_off_nudge();
+    watchdog.armed = TRUE;
+    watchdog_kick();
 }
 
 static void floppy_end_command(void *ack, unsigned int ack_len)
 {
-    auto_off_arm();
+    watchdog_arm();
     usb_write(EP_TX, ack, ack_len);
     u_cons = u_prod = 0;
     if (floppy_state == ST_command_wait)
@@ -326,6 +358,7 @@ static void floppy_end_command(void *ack, unsigned int ack_len)
 static struct {
     unsigned int nr_index;
     unsigned int max_index;
+    uint32_t max_index_linger;
     time_t deadline;
 } read;
 
@@ -344,8 +377,6 @@ static void rdata_encode_flux(void)
     timcnt_t prev = dma.prev_sample, curr, next;
     uint32_t ticks;
 
-    ASSERT(read.nr_index < read.max_index);
-
     /* We don't want to race the Index IRQ handler. */
     IRQ_global_disable();
 
@@ -361,9 +392,9 @@ static void rdata_encode_flux(void)
         u_buf[U_MASK(u_prod++)] = 0xff;
         u_buf[U_MASK(u_prod++)] = FLUXOP_INDEX;
         _write_28bit(ticks);
-        /* Defer auto-off while read is progressing (as measured by index
+        /* Defer watchdog while read is progressing (as measured by index
          * pulses).  */
-        auto_off_nudge();
+        watchdog_kick();
     }
 
     IRQ_global_enable();
@@ -439,6 +470,7 @@ static uint8_t floppy_read_prep(const struct gw_read_flux *rf)
     read.max_index = rf->max_index ?: INT_MAX;
     read.deadline = flux_op.start;
     read.deadline += rf->ticks ? time_from_samples(rf->ticks) : INT_MAX;
+    read.max_index_linger = time_from_samples(rf->max_index_linger);
 
     return ACK_OKAY;
 }
@@ -477,10 +509,20 @@ static void floppy_read(void)
             floppy_state = ST_read_flux_drain;
             u_cons = u_prod = avail = 0;
 
-        } else if ((read.nr_index >= read.max_index)
-                   || (time_since(read.deadline) >= 0)) {
+        } else if (read.nr_index >= read.max_index) {
 
-            /* Read all requested data. */
+            /* Index limit is reached: Now linger for the specified time. */
+            time_t deadline = time_now() + read.max_index_linger;
+            if (time_diff(deadline, read.deadline) > 0)
+                read.deadline = deadline;
+            /* Disable max_index check: It's now become a linger deadline. */
+            read.max_index = INT_MAX;
+
+        }
+
+        else if (time_since(read.deadline) >= 0) {
+
+            /* Deadline is reached: End the read now. */
             floppy_flux_end();
             floppy_state = ST_read_flux_drain;
 
@@ -1077,7 +1119,7 @@ static void process_command(void)
     uint8_t len = u_buf[1];
     uint8_t resp_sz = 2;
 
-    auto_off_arm();
+    watchdog_arm();
     act_led(TRUE);
 
     switch (cmd) {
@@ -1157,17 +1199,18 @@ static void process_command(void)
         goto out;
     }
     case CMD_READ_FLUX: {
-        struct gw_read_flux rf;
-        if (len != (2 + sizeof(rf)))
+        struct gw_read_flux rf = {
+            .max_index_linger = sample_us(500)
+        };
+        if ((len < (2 + offsetof(struct gw_read_flux, max_index_linger)))
+            || (len > (2 + sizeof(rf))))
             goto bad_command;
         memcpy(&rf, &u_buf[2], len-2);
         u_buf[1] = floppy_read_prep(&rf);
         goto out;
     }
     case CMD_WRITE_FLUX: {
-        struct gw_write_flux wf = {
-            .cue_at_index = 1,
-            .terminate_at_index = 0 };
+        struct gw_write_flux wf;
         if (len != (2 + sizeof(wf)))
             goto bad_command;
         memcpy(&wf, &u_buf[2], len-2);
@@ -1266,7 +1309,7 @@ bad_command:
 
 static void floppy_configure(void)
 {
-    auto_off_arm();
+    watchdog_arm();
     floppy_flux_end();
     floppy_state = ST_command_wait;
     u_cons = u_prod = 0;
@@ -1277,8 +1320,10 @@ void floppy_process(void)
 {
     int len;
 
-    if (auto_off.armed && (time_since(auto_off.deadline) >= 0))
-        do_auto_off();
+    if (watchdog.armed && (time_since(watchdog.deadline) >= 0)) {
+        floppy_configure();
+        quiesce_drives();
+    }
 
     switch (floppy_state) {
 

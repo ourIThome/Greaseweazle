@@ -164,6 +164,7 @@ def get_image_class(name):
                     '.ima': 'IMG',
                     '.img': 'IMG',
                     '.ipf': 'IPF',
+                    '.dsk': 'EDSK',
                     '.raw': 'KryoFlux' }
     if os.path.isdir(name):
         typename = 'KryoFlux'
@@ -185,8 +186,6 @@ def with_drive_selected(fn, usb, args, *_args, **_kwargs):
     except KeyboardInterrupt:
         print()
         usb.reset()
-        usb.ser.close()
-        usb.ser.open()
         raise
     finally:
         usb.drive_motor(args.drive[1], False)

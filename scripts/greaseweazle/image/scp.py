@@ -12,6 +12,13 @@ from greaseweazle.flux import Flux
 from .image import Image
 
 
+# Names for disktype byte in SCP file header
+DiskType = {
+    'amiga': 0x04,
+    'c64':   0x00
+}
+
+
 class SCPOpts:
     """legacy_ss: Set to True to generate (incorrect) legacy single-sided
     SCP image.
@@ -19,6 +26,20 @@ class SCPOpts:
 
     def __init__(self):
         self.legacy_ss = False
+        self._disktype = 0x80 # Other
+
+    @property
+    def disktype(self):
+        return self._disktype
+    @disktype.setter
+    def disktype(self, disktype):
+        try:
+            self._disktype = DiskType[disktype.lower()]
+        except KeyError:
+            try:
+                self._disktype = int(disktype, 0)
+            except ValueError:
+                raise error.Fatal("Bad SCP disktype: '%s'" % disktype)
 
 
 class SCPTrack:
@@ -78,9 +99,9 @@ class SCP(Image):
             trk_offs = trk_offs[:off]
 
         # Parse the extension block introduced by github:markusC64/g64conv.
-        # b'EXTS', length, <length byte Extension Area>
+        # b'EXTS', length, <length bytes: Extension Area>
         # Extension Area contains consecutive chunks of the form:
-        # ID, length, <length bytes of ID-specific dat>
+        # ID, length, <length bytes: ID-specific data>
         ext_sig, ext_len = struct.unpack('<4sI', dat[0x2b0:0x2b8])
         min_tdh = min(filter(lambda x: x != 0, trk_offs), default=0)
         if ext_sig == b'EXTS' and 0x2b8 + ext_len <= min_tdh:
@@ -88,6 +109,11 @@ class SCP(Image):
             while end - pos >= 8:
                 chk_sig, chk_len = struct.unpack('<4sI', dat[pos:pos+8])
                 pos += 8
+                # WRSP: WRite SPlice information block.
+                # Data is comprised of >= 169 32-bit values:
+                #  0: Flags (currently unused; must be zero)
+                #  N: Write splice/overlap position for track N, in SCP ticks
+                #     (zero if the track is unused)
                 if chk_sig == b'WRSP' and chk_len >= 169*4:
                     # Write-splice positions for writing out SCP tracks
                     # correctly to disk.
@@ -291,7 +317,7 @@ class SCP(Image):
         header = struct.pack("<3s9BI",
                              b"SCP",    # Signature
                              0,         # Version
-                             0x80,      # DiskType = Other
+                             self.opts.disktype,
                              self.nr_revs, 0, ntracks-1,
                              flags,
                              0,         # 16-bit cell width
